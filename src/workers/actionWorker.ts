@@ -2,16 +2,6 @@ import { Job } from 'bullmq';
 import { PrismaClient } from '@prisma/client';
 import { appendGovernanceLog } from '../services/governanceLogService.js';
 
-/**
- * Action Worker
- * 
- * Responsible for:
- * 1. Validating workflow is in DECISION_PENDING state
- * 2. Executing final side effects (trigger external systems, send notifications, etc.)
- * 3. Transitioning to ACTION_QUEUED then COMPLETED state
- * 4. Recording all state transitions in governance log
- * 5. Final workflow completion
- */
 export async function processAction(
   job: Job<{
     workflowId: string;
@@ -22,96 +12,108 @@ export async function processAction(
   const prisma = new PrismaClient();
 
   try {
-    console.log(
-      `[ACTION WORKER] Processing workflow: ${workflowId} (trace: ${traceId})`
-    );
-
-    // First transition: Move to ACTION_QUEUED
-    let currentRecord = await prisma.$transaction(async (tx: any) => {
+    const queuedRecord = await prisma.$transaction(async (tx) => {
       const workflow = await tx.workflowRecord.findUnique({
-        where: { id: workflowId },
+        where: { id: workflowId }
       });
 
       if (!workflow) {
         throw new Error(`Workflow ${workflowId} not found`);
       }
 
-      // Validate state transition
-      if (workflow.status !== 'DECISION_PENDING') {
-        throw new Error(
-          `Invalid state transition: ${workflow.status} → ACTION_QUEUED (expected DECISION_PENDING)`
-        );
+      if (workflow.status === 'COMPLETED') {
+        return workflow;
       }
 
-      console.log(
-        `[ACTION WORKER] Workflow ${workflowId} is in DECISION_PENDING state, moving to ACTION_QUEUED`
-      );
+      if (workflow.status === 'ACTION_QUEUED') {
+        return workflow;
+      }
 
-      // Update to ACTION_QUEUED
-      const updated = await tx.workflowRecord.update({
+      if (workflow.status !== 'DECISION_PENDING') {
+        throw new Error(`Invalid state transition: ${workflow.status} -> ACTION_QUEUED`);
+      }
+
+      return tx.workflowRecord.update({
         where: { id: workflowId },
-        data: {
-          status: 'ACTION_QUEUED',
-        },
+        data: { status: 'ACTION_QUEUED' }
       });
-
-      // Create governance log entry
-      await appendGovernanceLog({
-        prisma: tx,
-        workflowId,
-        traceId,
-        fromState: 'DECISION_PENDING',
-        toState: 'ACTION_QUEUED',
-        actor: 'action_worker',
-        payloadSnapshot: updated.contextData,
-      });
-
-      console.log(
-        `[ACTION WORKER] Governance log created: DECISION_PENDING → ACTION_QUEUED for ${workflowId}`
-      );
-
-      return updated;
     });
 
-    // Execute side effects
-    console.log(`[ACTION WORKER] Executing side effects for ${workflowId}...`);
-    const actionResult = await executeSideEffects(
-      workflowId,
-      currentRecord.contextData
-    );
+    if (queuedRecord.status === 'COMPLETED') {
+      return {
+        success: true,
+        workflowId,
+        finalStatus: queuedRecord.status,
+        completedAt: queuedRecord.completedAt
+      };
+    }
 
-    console.log(
-      `[ACTION WORKER] Side effects completed for ${workflowId}:`,
-      actionResult
-    );
+    const contextData = asObject(queuedRecord.contextData);
+    const decision = asObject(contextData.decision);
 
-    // Second transition: Move to COMPLETED
-    const finalRecord = await prisma.$transaction(async (tx: any) => {
+    const recommendedCare = String(decision.recommended_care ?? queuedRecord.recommendedCare ?? 'general_care');
+
+    const referral = {
+      referral_id: `ref_${Date.now()}`,
+      provider: 'City PT Clinic',
+      provider_type: recommendedCare === 'physical_therapy' ? 'telehealth' : 'in_person',
+      in_network: true,
+      is_leakage: false,
+      navigator_notified: true,
+      created_at: new Date().toISOString()
+    };
+
+    const isAdhered = recommendedCare === 'physical_therapy' && referral.provider_type === 'telehealth';
+    const actionResult = {
+      action: 'referral_created',
+      provider: referral.provider,
+      provider_type: referral.provider_type,
+      in_network: referral.in_network,
+      is_leakage: referral.is_leakage,
+      referral_id: referral.referral_id,
+      navigator_notified: referral.navigator_notified
+    };
+
+    const finalRecord = await prisma.$transaction(async (tx) => {
       const workflow = await tx.workflowRecord.findUnique({
-        where: { id: workflowId },
+        where: { id: workflowId }
       });
 
       if (!workflow) {
         throw new Error(`Workflow ${workflowId} not found`);
       }
 
-      const now = new Date();
+      if (workflow.status === 'COMPLETED') {
+        return workflow;
+      }
 
-      // Update to COMPLETED
+      if (workflow.status !== 'ACTION_QUEUED') {
+        throw new Error(`Invalid state transition: ${workflow.status} -> COMPLETED`);
+      }
+
+      const workflowContext = asObject(workflow.contextData);
+      const now = new Date();
       const completed = await tx.workflowRecord.update({
         where: { id: workflowId },
         data: {
           status: 'COMPLETED',
           completedAt: now,
+          actualPathway: workflow.recommendedPathway,
+          actualCare: recommendedCare,
+          isAdhered,
+          isLeakage: referral.is_leakage,
           contextData: {
-            ...workflow.contextData,
+            ...workflowContext,
             actionResult,
-            completedAt: now.toISOString(),
-          },
-        },
+            adherence: {
+              is_adhered: isAdhered,
+              calculated_at: now.toISOString()
+            }
+          } as never
+        }
       });
 
-      // Create final governance log entry
+      const adherenceNarrative = isAdhered ? 'Pathway adhered.' : 'Pathway not adhered.';
       await appendGovernanceLog({
         prisma: tx,
         workflowId,
@@ -119,35 +121,33 @@ export async function processAction(
         fromState: 'ACTION_QUEUED',
         toState: 'COMPLETED',
         actor: 'action_worker',
-        payloadSnapshot: completed.contextData,
+        narrative: `Referral created for City PT Clinic (${referral.provider_type === 'telehealth' ? 'Telehealth' : 'In-Person'}, In-Network). Care navigator notified. Workflow completed. No overrides. ${adherenceNarrative}`,
+        payloadSnapshot: {
+          actionResult,
+          referral,
+          is_adhered: isAdhered,
+          is_overridden: completed.isOverridden,
+          is_leakage: completed.isLeakage
+        }
       });
-
-      console.log(
-        `[ACTION WORKER] Governance log created: ACTION_QUEUED → COMPLETED for ${workflowId}`
-      );
 
       return completed;
     });
-
-    console.log(
-      `[ACTION WORKER] Successfully completed workflow ${workflowId}`
-    );
 
     return {
       success: true,
       workflowId,
       finalStatus: finalRecord.status,
-      completedAt: finalRecord.completedAt,
+      completedAt: finalRecord.completedAt
     };
   } catch (error) {
     console.error(`[ACTION WORKER] Error processing ${workflowId}:`, error);
 
-    // Update workflow to FAILED state on error
     try {
       const prismaError = new PrismaClient();
-      await prismaError.$transaction(async (tx: any) => {
+      await prismaError.$transaction(async (tx) => {
         const workflow = await tx.workflowRecord.findUnique({
-          where: { id: workflowId },
+          where: { id: workflowId }
         });
 
         if (workflow && workflow.status !== 'FAILED') {
@@ -155,28 +155,29 @@ export async function processAction(
             where: { id: workflowId },
             data: {
               status: 'FAILED',
-              retryCount: (workflow.retryCount || 0) + 1,
-            },
+              retryCount: (workflow.retryCount || 0) + 1
+            }
           });
 
           await appendGovernanceLog({
             prisma: tx,
             workflowId,
             traceId,
-            fromState: workflow.status as any,
+            fromState: workflow.status,
             toState: 'FAILED',
             actor: 'action_worker',
+            narrative: `Action execution failed due to an unexpected error: ${(error as Error).message}`,
             payloadSnapshot: {
-              ...failedRecord.contextData,
+              ...asObject(failedRecord.contextData),
               error: (error as Error).message,
-              failedAt: new Date().toISOString(),
-            },
+              failedAt: new Date().toISOString()
+            }
           });
         }
       });
-      prismaError.$disconnect();
+      await prismaError.$disconnect();
     } catch (logError) {
-      console.error(`[ACTION WORKER] Failed to log error state:`, logError);
+      console.error('[ACTION WORKER] Failed to log error state:', logError);
     }
 
     throw error;
@@ -185,123 +186,10 @@ export async function processAction(
   }
 }
 
-/**
- * Execute side effects based on workflow type
- * This is where external systems are triggered (payment gateways, shipping APIs, etc.)
- */
-async function executeSideEffects(
-  workflowId: string,
-  context: any
-): Promise<{
-  type: string;
-  status: string;
-  externalId?: string;
-  timestamp: string;
-  details?: any;
-}> {
-  const routing = context.routingDecision;
-
-  console.log(
-    `[ACTION WORKER] Executing side effects for route: ${routing?.route}`
-  );
-
-  // Execute route-specific side effects
-  switch (routing?.route) {
-    case 'PAYMENT_PROCESSING':
-      return await processPayment(workflowId, context);
-
-    case 'ORDER_FULFILLMENT':
-      return await fulfillOrder(workflowId, context);
-
-    default:
-      return {
-        type: 'GENERIC_ACTION',
-        status: 'COMPLETED',
-        timestamp: new Date().toISOString(),
-        details: 'Generic workflow action completed',
-      };
+function asObject(value: unknown): Record<string, unknown> {
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
   }
-}
 
-/**
- * Process payment side effects
- * In production: calls payment gateway, processes transaction, etc.
- */
-async function processPayment(
-  workflowId: string,
-  context: any
-): Promise<{
-  type: string;
-  status: string;
-  externalId?: string;
-  timestamp: string;
-  details?: any;
-}> {
-  const input = context.input;
-
-  console.log(
-    `[ACTION WORKER] Processing payment: $${input.paymentAmount} for merchant ${input.merchant}`
-  );
-
-  // Simulate payment processing (in production: call payment gateway)
-  // For demo: generate a mock transaction ID
-  const transactionId = `TXN_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-
-  // Simulate processing time
-  await new Promise((resolve) => setTimeout(resolve, 100));
-
-  return {
-    type: 'PAYMENT_PROCESSED',
-    status: 'SUCCESS',
-    externalId: transactionId,
-    timestamp: new Date().toISOString(),
-    details: {
-      amount: input.paymentAmount,
-      currency: input.currency,
-      merchant: input.merchant,
-      userId: input.userId,
-      message: 'Payment successfully processed',
-    },
-  };
-}
-
-/**
- * Fulfill order side effects
- * In production: sends to fulfillment system, notifies warehouse, etc.
- */
-async function fulfillOrder(
-  workflowId: string,
-  context: any
-): Promise<{
-  type: string;
-  status: string;
-  externalId?: string;
-  timestamp: string;
-  details?: any;
-}> {
-  const input = context.input;
-
-  console.log(
-    `[ACTION WORKER] Fulfilling order: ${input.orderId} for customer ${input.customerId}`
-  );
-
-  // Simulate order fulfillment (in production: send to warehouse management system)
-  const fulfillmentId = `FLF_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-
-  // Simulate fulfillment processing
-  await new Promise((resolve) => setTimeout(resolve, 100));
-
-  return {
-    type: 'ORDER_FULFILLED',
-    status: 'SUCCESS',
-    externalId: fulfillmentId,
-    timestamp: new Date().toISOString(),
-    details: {
-      orderId: input.orderId,
-      customerId: input.customerId,
-      itemCount: input.items?.length || 0,
-      shippingAddress: input.shippingAddress,
-      message: 'Order successfully submitted for fulfillment',
-    },
-  };
+  return {};
 }

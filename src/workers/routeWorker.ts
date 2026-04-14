@@ -23,53 +23,42 @@ export async function processRoute(
   const prisma = new PrismaClient();
 
   try {
-    console.log(
-      `[ROUTE WORKER] Processing workflow: ${workflowId} (trace: ${traceId})`
-    );
-
-    // Lock row using transaction to prevent concurrent updates
-    const updatedRecord = await prisma.$transaction(async (tx: any) => {
-      // Fetch current workflow
+    const updatedRecord = await prisma.$transaction(async (tx) => {
       const workflow = await tx.workflowRecord.findUnique({
-        where: { id: workflowId },
+        where: { id: workflowId }
       });
 
       if (!workflow) {
         throw new Error(`Workflow ${workflowId} not found`);
       }
 
-      // Validate state transition
-      if (workflow.status !== 'INITIATED') {
-        throw new Error(
-          `Invalid state transition: ${workflow.status} → ROUTING (expected INITIATED)`
-        );
+      if (workflow.status === 'ROUTING' || workflow.status === 'DECISION_PENDING' || workflow.status === 'ACTION_QUEUED' || workflow.status === 'COMPLETED') {
+        return workflow;
       }
 
-      console.log(
-        `[ROUTE WORKER] Workflow ${workflowId} is in INITIATED state, proceeding with routing`
-      );
+      if (workflow.status !== 'INITIATED') {
+        throw new Error(`Invalid state transition: ${workflow.status} -> ROUTING`);
+      }
 
-      // Execute routing logic
-      const inputData = workflow.contextData.input;
+      const contextData = asObject(workflow.contextData);
+      const inputData = asObject(contextData.input);
       const routingDecision = classifyWorkflow(inputData);
 
-      console.log(
-        `[ROUTE WORKER] Routing decision for ${workflowId}: ${routingDecision.route}`
-      );
+      const updatedContext = {
+        ...contextData,
+        pathway_selected: routingDecision.recommended_pathway,
+        routingDecision
+      };
 
-      // Update workflow status to ROUTING and append routing result
       const updated = await tx.workflowRecord.update({
         where: { id: workflowId },
         data: {
           status: 'ROUTING',
-          contextData: {
-            ...workflow.contextData,
-            routingDecision,
-          },
-        },
+          recommendedPathway: routingDecision.recommended_pathway,
+          contextData: updatedContext as never
+        }
       });
 
-      // Create governance log entry for state transition
       await appendGovernanceLog({
         prisma: tx,
         workflowId,
@@ -77,21 +66,22 @@ export async function processRoute(
         fromState: 'INITIATED',
         toState: 'ROUTING',
         actor: 'route_worker',
-        payloadSnapshot: updated.contextData,
+        narrative: routingDecision.narrative,
+        payloadSnapshot: {
+          routingDecision,
+          input: inputData
+        }
       });
-
-      console.log(
-        `[ROUTE WORKER] Governance log created: INITIATED → ROUTING for ${workflowId}`
-      );
 
       return updated;
     });
 
-    // Enqueue next job (decision worker)
-    await workflowQueue.add('decision', {
-      workflowId,
-      traceId,
-    });
+    if (updatedRecord.status === 'ROUTING') {
+      await workflowQueue.add('decision', {
+        workflowId,
+        traceId,
+      });
+    }
 
     console.log(
       `[ROUTE WORKER] Successfully processed ${workflowId}, decision job enqueued`
@@ -105,30 +95,30 @@ export async function processRoute(
   } catch (error) {
     console.error(`[ROUTE WORKER] Error processing ${workflowId}:`, error);
 
-    // Update workflow to FAILED state on error
     try {
       const prismaError = new PrismaClient();
-      await prismaError.$transaction(async (tx: any) => {
+      await prismaError.$transaction(async (tx) => {
         const workflow = await tx.workflowRecord.findUnique({
-          where: { id: workflowId },
+          where: { id: workflowId }
         });
 
         if (workflow && workflow.status !== 'FAILED') {
           await tx.workflowRecord.update({
             where: { id: workflowId },
-            data: { status: 'FAILED' },
+            data: { status: 'FAILED' }
           });
 
           await appendGovernanceLog({
             prisma: tx,
             workflowId,
             traceId,
-            fromState: workflow.status as any,
+            fromState: workflow.status,
             toState: 'FAILED',
             actor: 'route_worker',
+            narrative: `Routing failed due to an unexpected error: ${(error as Error).message}`,
             payloadSnapshot: {
               error: (error as Error).message,
-            },
+            }
           });
         }
       });
@@ -144,39 +134,54 @@ export async function processRoute(
 }
 
 /**
- * Classify workflow type based on input data
- * This is the business logic for the routing stage
+ * Assign clinical pathway based on symptom and red-flag intake data.
  */
-function classifyWorkflow(input: any): {
-  route: string;
-  category: string;
-  priority: string;
+function classifyWorkflow(input: Record<string, unknown>): {
+  recommended_pathway: 'MSK' | 'EMERGENCY' | 'GENERAL';
+  confidence: 'high' | 'medium';
+  rule_matched: 'musculoskeletal_symptoms_no_red_flags' | 'red_flag_detected' | 'default_general_pathway';
+  override: null;
+  narrative: string;
 } {
-  // Determine route based on input characteristics
-  if (input.paymentAmount !== undefined) {
-    // This is a payment workflow
-    const amount = input.paymentAmount;
+  const symptom = String(input.symptom ?? '').toLowerCase();
+  const redFlags = Boolean(input.red_flags);
+
+  if (redFlags) {
     return {
-      route: 'PAYMENT_PROCESSING',
-      category: amount > 1000 ? 'HIGH_VALUE' : 'STANDARD',
-      priority: amount > 5000 ? 'URGENT' : 'NORMAL',
+      recommended_pathway: 'EMERGENCY',
+      confidence: 'high',
+      rule_matched: 'red_flag_detected',
+      override: null,
+      narrative: 'Red flags detected in intake. Patient routed to Emergency Pathway for immediate escalation.'
     };
   }
 
-  if (input.orderId !== undefined) {
-    // This is an order workflow
-    const itemCount = input.items?.length || 0;
+  const mskTerms = ['back pain', 'spine', 'neck pain', 'joint pain'];
+  const hasMskSymptoms = mskTerms.some((term) => symptom.includes(term));
+
+  if (hasMskSymptoms) {
     return {
-      route: 'ORDER_FULFILLMENT',
-      category: itemCount > 5 ? 'BULK_ORDER' : 'STANDARD_ORDER',
-      priority: input.expedited ? 'URGENT' : 'NORMAL',
+      recommended_pathway: 'MSK',
+      confidence: 'high',
+      rule_matched: 'musculoskeletal_symptoms_no_red_flags',
+      override: null,
+      narrative: 'Symptoms matched MSK Pathway criteria. No red flags detected. Patient assigned to MSK Spine Pathway automatically.'
     };
   }
 
-  // Default route
   return {
-    route: 'GENERIC_WORKFLOW',
-    category: 'UNKNOWN',
-    priority: 'NORMAL',
+    recommended_pathway: 'GENERAL',
+    confidence: 'medium',
+    rule_matched: 'default_general_pathway',
+    override: null,
+    narrative: 'Symptoms did not match MSK-specific routing rules. Patient assigned to General Care Pathway.'
   };
+}
+
+function asObject(value: unknown): Record<string, unknown> {
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
+  }
+
+  return {};
 }

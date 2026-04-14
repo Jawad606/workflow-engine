@@ -23,52 +23,43 @@ export async function processDecision(
   const prisma = new PrismaClient();
 
   try {
-    console.log(
-      `[DECISION WORKER] Processing workflow: ${workflowId} (trace: ${traceId})`
-    );
-
-    // Lock row using transaction
-    const updatedRecord = await prisma.$transaction(async (tx: any) => {
-      // Fetch current workflow
+    const updatedRecord = await prisma.$transaction(async (tx) => {
       const workflow = await tx.workflowRecord.findUnique({
-        where: { id: workflowId },
+        where: { id: workflowId }
       });
 
       if (!workflow) {
         throw new Error(`Workflow ${workflowId} not found`);
       }
 
-      // Validate state transition
-      if (workflow.status !== 'ROUTING') {
-        throw new Error(
-          `Invalid state transition: ${workflow.status} → DECISION_PENDING (expected ROUTING)`
-        );
+      if (workflow.status === 'DECISION_PENDING' || workflow.status === 'ACTION_QUEUED' || workflow.status === 'COMPLETED') {
+        return workflow;
       }
 
-      console.log(
-        `[DECISION WORKER] Workflow ${workflowId} is in ROUTING state, proceeding with decision`
-      );
+      if (workflow.status !== 'ROUTING') {
+        throw new Error(`Invalid state transition: ${workflow.status} -> DECISION_PENDING`);
+      }
 
-      // Execute decision logic
-      const decisionResult = evaluateWorkflow(workflow.contextData);
+      const contextData = asObject(workflow.contextData);
+      const input = asObject(contextData.input);
+      const pathway = workflow.recommendedPathway ?? String(contextData.pathway_selected ?? 'GENERAL');
+      const decision = evaluateWorkflow(pathway, input);
 
-      console.log(
-        `[DECISION WORKER] Decision for ${workflowId}: ${decisionResult.decision}`
-      );
+      const updatedContext = {
+        ...contextData,
+        decision,
+        pathway_selected: pathway
+      };
 
-      // Update workflow status to DECISION_PENDING and append decision result
       const updated = await tx.workflowRecord.update({
         where: { id: workflowId },
         data: {
           status: 'DECISION_PENDING',
-          contextData: {
-            ...workflow.contextData,
-            decisionResult,
-          },
-        },
+          recommendedCare: decision.recommended_care,
+          contextData: updatedContext as never
+        }
       });
 
-      // Create governance log entry
       await appendGovernanceLog({
         prisma: tx,
         workflowId,
@@ -76,21 +67,23 @@ export async function processDecision(
         fromState: 'ROUTING',
         toState: 'DECISION_PENDING',
         actor: 'decision_worker',
-        payloadSnapshot: updated.contextData,
+        narrative: decision.narrative,
+        payloadSnapshot: {
+          decision,
+          pathway,
+          input
+        }
       });
-
-      console.log(
-        `[DECISION WORKER] Governance log created: ROUTING → DECISION_PENDING for ${workflowId}`
-      );
 
       return updated;
     });
 
-    // Enqueue next job (action worker)
-    await workflowQueue.add('action', {
-      workflowId,
-      traceId,
-    });
+    if (updatedRecord.status === 'DECISION_PENDING') {
+      await workflowQueue.add('action', {
+        workflowId,
+        traceId,
+      });
+    }
 
     console.log(
       `[DECISION WORKER] Successfully processed ${workflowId}, action job enqueued`
@@ -104,30 +97,30 @@ export async function processDecision(
   } catch (error) {
     console.error(`[DECISION WORKER] Error processing ${workflowId}:`, error);
 
-    // Update workflow to FAILED state on error
     try {
       const prismaError = new PrismaClient();
-      await prismaError.$transaction(async (tx: any) => {
+      await prismaError.$transaction(async (tx) => {
         const workflow = await tx.workflowRecord.findUnique({
-          where: { id: workflowId },
+          where: { id: workflowId }
         });
 
         if (workflow && workflow.status !== 'FAILED') {
           await tx.workflowRecord.update({
             where: { id: workflowId },
-            data: { status: 'FAILED' },
+            data: { status: 'FAILED' }
           });
 
           await appendGovernanceLog({
             prisma: tx,
             workflowId,
             traceId,
-            fromState: workflow.status as any,
+            fromState: workflow.status,
             toState: 'FAILED',
             actor: 'decision_worker',
+            narrative: `Decisioning failed due to an unexpected error: ${(error as Error).message}`,
             payloadSnapshot: {
               error: (error as Error).message,
-            },
+            }
           });
         }
       });
@@ -143,106 +136,86 @@ export async function processDecision(
 }
 
 /**
- * Evaluate workflow conditions based on route classification
- * This is the business logic for the decision stage
+ * Evaluate care recommendation for the assigned clinical pathway.
  */
-function evaluateWorkflow(context: any): {
-  decision: string;
-  approved: boolean;
-  riskLevel: string;
-  reason?: string;
+function evaluateWorkflow(pathway: string, input: Record<string, unknown>): {
+  recommended_care: 'physical_therapy' | 'specialist_referral' | 'emergency' | 'general_care';
+  care_type: 'telehealth' | 'in_person' | null;
+  urgency: 'routine' | 'moderate' | 'urgent' | 'immediate';
+  conditions_met: string[];
+  override: null;
+  is_adhered: null;
+  narrative: string;
 } {
-  const routing = context.routingDecision;
+  const painLevel = Number(input.pain_level ?? 0);
+  const redFlags = Boolean(input.red_flags);
+  const failedPtHistory = Boolean(input.failed_pt_history);
 
-  // Decision logic based on route type
-  switch (routing?.route) {
-    case 'PAYMENT_PROCESSING':
-      return evaluatePayment(context.input, routing);
+  if (pathway === 'EMERGENCY') {
+    return {
+      recommended_care: 'emergency',
+      care_type: null,
+      urgency: 'immediate',
+      conditions_met: ['red_flags_detected', 'emergency_pathway'],
+      override: null,
+      is_adhered: null,
+      narrative: 'Emergency pathway selected due to clinical red flags. Immediate emergency care is recommended.'
+    };
+  }
 
-    case 'ORDER_FULFILLMENT':
-      return evaluateOrder(context.input, routing);
-
-    default:
+  if (pathway === 'MSK') {
+    if (painLevel <= 4 && !redFlags && !failedPtHistory) {
       return {
-        decision: 'APPROVE',
-        approved: true,
-        riskLevel: 'LOW',
-        reason: 'Default approval for generic workflow',
+        recommended_care: 'physical_therapy',
+        care_type: 'telehealth',
+        urgency: 'routine',
+        conditions_met: ['pain_level <= 4', 'no_red_flags', 'MSK_pathway', 'no_failed_pt_history'],
+        override: null,
+        is_adhered: null,
+        narrative: `PT-first pathway selected. Pain score mild (${painLevel}/10), no red flags, no prior failed PT on record. Telehealth Physical Therapy recommended as first line of care.`
       };
-  }
-}
+    }
 
-/**
- * Evaluate payment workflow
- */
-function evaluatePayment(input: any, routing: any): {
-  decision: string;
-  approved: boolean;
-  riskLevel: string;
-  reason?: string;
-} {
-  const amount = input.paymentAmount;
-  let riskLevel = 'LOW';
-  let approved = true;
-  let reason = '';
+    if (painLevel >= 5 && painLevel <= 7 && !redFlags) {
+      return {
+        recommended_care: 'physical_therapy',
+        care_type: 'in_person',
+        urgency: 'moderate',
+        conditions_met: ['pain_level_5_to_7', 'no_red_flags', 'MSK_pathway'],
+        override: null,
+        is_adhered: null,
+        narrative: `PT-first pathway selected. Pain score moderate (${painLevel}/10), no red flags. In-person Physical Therapy recommended with moderate urgency.`
+      };
+    }
 
-  // Risk assessment
-  if (amount > 10000) {
-    riskLevel = 'HIGH';
-    approved = false; // Requires manual review
-    reason = `High-value payment ($${amount}) requires manual review`;
-  } else if (amount > 5000) {
-    riskLevel = 'MEDIUM';
-    approved = true;
-    reason = `Medium-risk payment ($${amount}), auto-approved with monitoring`;
-  } else {
-    riskLevel = 'LOW';
-    approved = true;
-    reason = `Low-risk payment ($${amount}), standard processing`;
+    if (painLevel >= 8 || redFlags) {
+      return {
+        recommended_care: 'specialist_referral',
+        care_type: null,
+        urgency: 'urgent',
+        conditions_met: ['pain_level >= 8_or_red_flags', 'MSK_pathway'],
+        override: null,
+        is_adhered: null,
+        narrative: `High-risk MSK presentation detected (pain ${painLevel}/10 or red flags). Specialist referral recommended with urgent priority.`
+      };
+    }
   }
 
   return {
-    decision: approved ? 'APPROVE' : 'MANUAL_REVIEW',
-    approved,
-    riskLevel,
-    reason,
+    recommended_care: 'general_care',
+    care_type: null,
+    urgency: 'routine',
+    conditions_met: ['general_pathway_default'],
+    override: null,
+    is_adhered: null,
+    narrative: 'General care recommendation issued because pathway-specific PT-first rules were not met.'
   };
 }
 
-/**
- * Evaluate order workflow
- */
-function evaluateOrder(input: any, routing: any): {
-  decision: string;
-  approved: boolean;
-  riskLevel: string;
-  reason?: string;
-} {
-  const itemCount = input.items?.length || 0;
-  const isExpedited = input.expedited === true;
-  let riskLevel = 'LOW';
-  let approved = true;
-  let reason = '';
-
-  // Availability check (simulated)
-  if (isExpedited && itemCount > 10) {
-    riskLevel = 'HIGH';
-    approved = false;
-    reason = 'Cannot fulfill expedited order with >10 items';
-  } else if (itemCount > 50) {
-    riskLevel = 'MEDIUM';
-    approved = true;
-    reason = `Bulk order (${itemCount} items) requires warehouse coordination`;
-  } else {
-    riskLevel = 'LOW';
-    approved = true;
-    reason = `Standard order (${itemCount} items)`;
+function asObject(value: unknown): Record<string, unknown> {
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
   }
 
-  return {
-    decision: approved ? 'PROCEED' : 'HOLD_REVIEW',
-    approved,
-    riskLevel,
-    reason,
-  };
+  return {};
 }

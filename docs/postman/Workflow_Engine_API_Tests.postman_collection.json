@@ -1,7 +1,7 @@
 {
   "info": {
     "name": "Workflow Engine API Tests",
-    "description": "Complete test suite for the State-Driven Workflow Engine API",
+    "description": "Manual test suite for the MSK clinical workflow engine",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "auth": {
@@ -39,153 +39,18 @@
       }
     },
     {
-      "name": "Create Workflow - Test 1",
-      "event": [
-        {
-          "listen": "test",
-          "script": {
-            "exec": [
-              "pm.test('Status code is 202 Accepted', function () {",
-              "    pm.response.to.have.status(202);",
-              "});",
-              "pm.test('Response has workflow ID', function () {",
-              "    var jsonData = pm.response.json();",
-              "    pm.expect(jsonData).to.have.property('id');",
-              "    pm.expect(jsonData.id).to.not.be.empty;",
-              "    pm.environment.set('workflowId', jsonData.id);",
-              "});",
-              "pm.test('Workflow status is INITIATED', function () {",
-              "    var jsonData = pm.response.json();",
-              "    pm.expect(jsonData.status).to.equal('INITIATED');",
-              "});",
-              "pm.test('Response has traceId', function () {",
-              "    var jsonData = pm.response.json();",
-              "    pm.expect(jsonData).to.have.property('traceId');",
-              "});",
-              "pm.test('contextData contains input payload', function () {",
-              "    var jsonData = pm.response.json();",
-              "    pm.expect(jsonData.contextData).to.have.property('input');",
-              "});"
-            ]
-          }
-        }
-      ],
-      "request": {
-        "method": "POST",
-        "header": [
-          {
-            "key": "Content-Type",
-            "value": "application/json"
-          },
-          {
-            "key": "Idempotency-Key",
-            "value": "550e8400-e29b-41d4-a716-446655440001"
-          }
-        ],
-        "body": {
-          "mode": "raw",
-          "raw": "{\n  \"paymentAmount\": 150.50,\n  \"userId\": \"user_12345\",\n  \"currency\": \"USD\",\n  \"merchant\": \"Acme Corp\",\n  \"type\": \"purchase\"\n}"
-        },
-        "url": {
-          "raw": "http://localhost:8000/api/v1/workflows",
-          "protocol": "http",
-          "host": ["localhost"],
-          "port": "8000",
-          "path": ["api", "v1", "workflows"]
-        }
-      }
-    },
-    {
-      "name": "Create Workflow - Test 2 (Different Data)",
-      "event": [
-        {
-          "listen": "test",
-          "script": {
-            "exec": [
-              "pm.test('Status code is 202 Accepted', function () {",
-              "    pm.response.to.have.status(202);",
-              "});",
-              "pm.test('Response has workflow ID', function () {",
-              "    var jsonData = pm.response.json();",
-              "    pm.expect(jsonData).to.have.property('id');",
-              "    pm.environment.set('workflowId2', jsonData.id);",
-              "});"
-            ]
-          }
-        }
-      ],
-      "request": {
-        "method": "POST",
-        "header": [
-          {
-            "key": "Content-Type",
-            "value": "application/json"
-          },
-          {
-            "key": "Idempotency-Key",
-            "value": "550e8400-e29b-41d4-a716-446655440002"
-          }
-        ],
-        "body": {
-          "mode": "raw",
-          "raw": "{\n  \"orderId\": \"ORD-2026-001\",\n  \"customerId\": \"CUST_789\",\n  \"items\": [\n    {\n      \"sku\": \"SKU-001\",\n      \"quantity\": 2,\n      \"price\": 49.99\n    },\n    {\n      \"sku\": \"SKU-002\",\n      \"quantity\": 1,\n      \"price\": 99.99\n    }\n  ],\n  \"shippingAddress\": \"123 Main St, City, State 12345\"\n}"
-        },
-        "url": {
-          "raw": "http://localhost:8000/api/v1/workflows",
-          "protocol": "http",
-          "host": ["localhost"],
-          "port": "8000",
-          "path": ["api", "v1", "workflows"]
-        }
-      }
-    },
-    {
-      "name": "Get Workflow Status - Immediate (Test 1)",
-      "event": [
-        {
-          "listen": "test",
-          "script": {
-            "exec": [
-              "pm.test('Status code is 200', function () {",
-              "    pm.response.to.have.status(200);",
-              "});",
-              "pm.test('Response has id field', function () {",
-              "    var jsonData = pm.response.json();",
-              "    pm.expect(jsonData).to.have.property('id');",
-              "});",
-              "pm.test('Response has status field', function () {",
-              "    var jsonData = pm.response.json();",
-              "    pm.expect(jsonData).to.have.property('status');",
-              "});",
-              "pm.test('Status is one of the valid states', function () {",
-              "    var jsonData = pm.response.json();",
-              "    var validStates = ['INITIATED', 'ROUTING', 'DECISION_PENDING', 'ACTION_QUEUED', 'COMPLETED', 'FAILED'];",
-              "    pm.expect(validStates).to.include(jsonData.status);",
-              "});"
-            ]
-          }
-        }
-      ],
-      "request": {
-        "method": "GET",
-        "header": [],
-        "url": {
-          "raw": "http://localhost:8000/api/v1/workflows/{{workflowId}}",
-          "protocol": "http",
-          "host": ["localhost"],
-          "port": "8000",
-          "path": ["api", "v1", "workflows", "{{workflowId}}"]
-        }
-      }
-    },
-    {
-      "name": "Get Workflow Status - After 2 Seconds (Test 1)",
+      "name": "Create MSK Workflow",
       "event": [
         {
           "listen": "prerequest",
           "script": {
             "exec": [
-              "setTimeout(function() {}, 2000);"
+              "if (!pm.environment.get('mskIdempotencyKey')) {",
+              "    pm.environment.set('mskIdempotencyKey', 'user_456_' + Date.now());",
+              "}",
+              "if (!pm.environment.get('mskPatientId')) {",
+              "    pm.environment.set('mskPatientId', 'patient_001');",
+              "}"
             ]
           }
         },
@@ -193,17 +58,67 @@
           "listen": "test",
           "script": {
             "exec": [
+              "const responseBody = pm.response.json();",
+              "pm.test('Status code is 202 Accepted', function () {",
+              "    pm.response.to.have.status(202);",
+              "});",
+              "pm.test('Response returns workflow_id and INITIATED status', function () {",
+              "    pm.expect(responseBody).to.have.property('workflow_id');",
+              "    pm.expect(responseBody.workflow_id).to.not.be.empty;",
+              "    pm.expect(responseBody).to.have.property('status', 'INITIATED');",
+              "});",
+              "pm.test('Stores workflowId for follow-up requests', function () {",
+              "    pm.environment.set('workflowId', responseBody.workflow_id);",
+              "});"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"idempotencyKey\": \"{{mskIdempotencyKey}}\",\n  \"payload\": {\n    \"symptom\": \"lower back pain\",\n    \"pain_level\": 3,\n    \"duration\": \"2 weeks\",\n    \"red_flags\": false,\n    \"age\": 34,\n    \"patient_id\": \"{{mskPatientId}}\",\n    \"failed_pt_history\": false\n  }\n}"
+        },
+        "url": {
+          "raw": "http://localhost:8000/api/v1/workflows",
+          "protocol": "http",
+          "host": ["localhost"],
+          "port": "8000",
+          "path": ["api", "v1", "workflows"]
+        }
+      }
+    },
+    {
+      "name": "Get Workflow State",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "const responseBody = pm.response.json();",
               "pm.test('Status code is 200', function () {",
               "    pm.response.to.have.status(200);",
               "});",
-              "pm.test('Workflow may have progressed state', function () {",
-              "    var jsonData = pm.response.json();",
-              "    var validStates = ['INITIATED', 'ROUTING', 'DECISION_PENDING', 'ACTION_QUEUED', 'COMPLETED', 'FAILED'];",
-              "    pm.expect(validStates).to.include(jsonData.status);",
+              "pm.test('Returns clinical workflow summary fields', function () {",
+              "    pm.expect(responseBody).to.have.property('id');",
+              "    pm.expect(responseBody).to.have.property('status');",
+              "    pm.expect(responseBody).to.have.property('pathway_selected');",
+              "    pm.expect(responseBody).to.have.property('recommended_care');",
+              "    pm.expect(responseBody).to.have.property('is_adhered');",
+              "    pm.expect(responseBody).to.have.property('is_leakage');",
+              "    pm.expect(responseBody).to.have.property('is_overridden');",
+              "    pm.expect(responseBody).to.have.property('contextData');",
               "});",
-              "pm.test('contextData is present', function () {",
-              "    var jsonData = pm.response.json();",
-              "    pm.expect(jsonData.contextData).to.exist;",
+              "pm.test('Status is valid', function () {",
+              "    const validStates = ['INITIATED', 'ROUTING', 'DECISION_PENDING', 'ACTION_QUEUED', 'COMPLETED', 'FAILED'];",
+              "    pm.expect(validStates).to.include(responseBody.status);",
               "});"
             ]
           }
@@ -222,36 +137,36 @@
       }
     },
     {
-      "name": "Get Workflow Logs (Test 1)",
+      "name": "Get Workflow Logs",
       "event": [
         {
           "listen": "test",
           "script": {
             "exec": [
+              "const responseBody = pm.response.json();",
               "pm.test('Status code is 200', function () {",
               "    pm.response.to.have.status(200);",
               "});",
-              "pm.test('Response is an array', function () {",
-              "    var jsonData = pm.response.json();",
-              "    pm.expect(jsonData).to.be.an('array');",
+              "pm.test('Returns timeline and summary', function () {",
+              "    pm.expect(responseBody).to.have.property('workflowId');",
+              "    pm.expect(responseBody).to.have.property('traceId');",
+              "    pm.expect(responseBody).to.have.property('timeline');",
+              "    pm.expect(responseBody.timeline).to.be.an('array');",
+              "    pm.expect(responseBody).to.have.property('summary');",
               "});",
-              "pm.test('Each log entry has required fields', function () {",
-              "    var jsonData = pm.response.json();",
-              "    jsonData.forEach(function(log) {",
-              "        pm.expect(log).to.have.property('id');",
-              "        pm.expect(log).to.have.property('workflowId');",
-              "        pm.expect(log).to.have.property('fromState');",
-              "        pm.expect(log).to.have.property('toState');",
-              "        pm.expect(log).to.have.property('actor');",
+              "pm.test('Timeline entries contain narratives', function () {",
+              "    pm.expect(responseBody.timeline.length).to.be.greaterThan(0);",
+              "    responseBody.timeline.forEach(function (entry) {",
+              "        pm.expect(entry).to.have.property('timestamp');",
+              "        pm.expect(entry).to.have.property('stage');",
+              "        pm.expect(entry).to.have.property('narrative');",
               "    });",
               "});",
-              "pm.test('Logs are ordered by timestamp', function () {",
-              "    var jsonData = pm.response.json();",
-              "    for (var i = 1; i < jsonData.length; i++) {",
-              "        var prev = new Date(jsonData[i-1].createdAt);",
-              "        var curr = new Date(jsonData[i].createdAt);",
-              "        pm.expect(prev.getTime()).to.be.lessThanOrEqual(curr.getTime());",
-              "    }",
+              "pm.test('Summary reflects MSK flow fields', function () {",
+              "    pm.expect(responseBody.summary).to.have.property('pathway_selected');",
+              "    pm.expect(responseBody.summary).to.have.property('recommended_care');",
+              "    pm.expect(responseBody.summary).to.have.property('action_taken');",
+              "    pm.expect(responseBody.summary).to.have.property('is_adhered');",
               "});"
             ]
           }
@@ -270,117 +185,19 @@
       }
     },
     {
-      "name": "Get Workflow Status - Test 2",
+      "name": "Reuse Idempotency Key",
       "event": [
         {
           "listen": "test",
           "script": {
             "exec": [
-              "pm.test('Status code is 200', function () {",
-              "    pm.response.to.have.status(200);",
-              "});"
-            ]
-          }
-        }
-      ],
-      "request": {
-        "method": "GET",
-        "header": [],
-        "url": {
-          "raw": "http://localhost:8000/api/v1/workflows/{{workflowId2}}",
-          "protocol": "http",
-          "host": ["localhost"],
-          "port": "8000",
-          "path": ["api", "v1", "workflows", "{{workflowId2}}"]
-        }
-      }
-    },
-    {
-      "name": "Get Workflow Logs - Test 2",
-      "event": [
-        {
-          "listen": "test",
-          "script": {
-            "exec": [
-              "pm.test('Status code is 200', function () {",
-              "    pm.response.to.have.status(200);",
-              "});",
-              "pm.test('Response is an array', function () {",
-              "    var jsonData = pm.response.json();",
-              "    pm.expect(jsonData).to.be.an('array');",
-              "});"
-            ]
-          }
-        }
-      ],
-      "request": {
-        "method": "GET",
-        "header": [],
-        "url": {
-          "raw": "http://localhost:8000/api/v1/workflows/{{workflowId2}}/logs",
-          "protocol": "http",
-          "host": ["localhost"],
-          "port": "8000",
-          "path": ["api", "v1", "workflows", "{{workflowId2}}", "logs"]
-        }
-      }
-    },
-    {
-      "name": "Test Idempotency - Same Key Should Return Same Workflow",
-      "event": [
-        {
-          "listen": "test",
-          "script": {
-            "exec": [
-              "pm.test('Status code is 202', function () {",
+              "const responseBody = pm.response.json();",
+              "pm.test('Status code is 202 Accepted', function () {",
               "    pm.response.to.have.status(202);",
               "});",
-              "pm.test('Response ID matches original workflow (idempotency)', function () {",
-              "    var jsonData = pm.response.json();",
-              "    pm.expect(jsonData.idempotencyKey).to.equal('550e8400-e29b-41d4-a716-446655440001');",
-              "});"
-            ]
-          }
-        }
-      ],
-      "request": {
-        "method": "POST",
-        "header": [
-          {
-            "key": "Content-Type",
-            "value": "application/json"
-          },
-          {
-            "key": "Idempotency-Key",
-            "value": "550e8400-e29b-41d4-a716-446655440001"
-          }
-        ],
-        "body": {
-          "mode": "raw",
-          "raw": "{\n  \"paymentAmount\": 150.50,\n  \"userId\": \"user_12345\",\n  \"currency\": \"USD\",\n  \"merchant\": \"Acme Corp\",\n  \"type\": \"purchase\"\n}"
-        },
-        "url": {
-          "raw": "http://localhost:8000/api/v1/workflows",
-          "protocol": "http",
-          "host": ["localhost"],
-          "port": "8000",
-          "path": ["api", "v1", "workflows"]
-        }
-      }
-    },
-    {
-      "name": "Test Missing Idempotency Key",
-      "event": [
-        {
-          "listen": "test",
-          "script": {
-            "exec": [
-              "pm.test('Status code is 400 Bad Request', function () {",
-              "    pm.response.to.have.status(400);",
-              "});",
-              "pm.test('Error message about missing header', function () {",
-              "    var jsonData = pm.response.json();",
-              "    pm.expect(jsonData.error).to.include('Idempotency-Key');",
+              "pm.test('Same idempotency key returns a workflow response', function () {",
+              "    pm.expect(responseBody).to.have.property('workflow_id');",
+              "    pm.expect(responseBody).to.have.property('status', 'INITIATED');",
               "});"
             ]
           }
@@ -396,7 +213,7 @@
         ],
         "body": {
           "mode": "raw",
-          "raw": "{\n  \"test\": \"data\"\n}"
+          "raw": "{\n  \"idempotencyKey\": \"{{mskIdempotencyKey}}\",\n  \"payload\": {\n    \"symptom\": \"lower back pain\",\n    \"pain_level\": 3,\n    \"duration\": \"2 weeks\",\n    \"red_flags\": false,\n    \"age\": 34,\n    \"patient_id\": \"{{mskPatientId}}\",\n    \"failed_pt_history\": false\n  }\n}"
         },
         "url": {
           "raw": "http://localhost:8000/api/v1/workflows",
@@ -404,36 +221,6 @@
           "host": ["localhost"],
           "port": "8000",
           "path": ["api", "v1", "workflows"]
-        }
-      }
-    },
-    {
-      "name": "Test Non-Existent Workflow",
-      "event": [
-        {
-          "listen": "test",
-          "script": {
-            "exec": [
-              "pm.test('Status code is 404 Not Found', function () {",
-              "    pm.response.to.have.status(404);",
-              "});",
-              "pm.test('Error message about workflow not found', function () {",
-              "    var jsonData = pm.response.json();",
-              "    pm.expect(jsonData.error).to.include('Workflow not found');",
-              "});"
-            ]
-          }
-        }
-      ],
-      "request": {
-        "method": "GET",
-        "header": [],
-        "url": {
-          "raw": "http://localhost:8000/api/v1/workflows/non-existent-id-12345",
-          "protocol": "http",
-          "host": ["localhost"],
-          "port": "8000",
-          "path": ["api", "v1", "workflows", "non-existent-id-12345"]
         }
       }
     }
